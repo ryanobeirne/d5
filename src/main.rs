@@ -1,11 +1,15 @@
-use base64;
-use std::{convert::TryFrom, fmt, collections::HashMap, env, net, sync::Arc, sync::Mutex};
+use std::{collections::HashMap, convert::TryFrom, env, fmt, net, sync::Arc, sync::Mutex};
 use warp::{header, reply::with_status, Filter};
 use warp::{http::StatusCode as Code, reject::custom as warp_err};
 
+mod id;
+use id::Id;
+
 type WarpResult = Result<String, warp::Rejection>;
-type DB = Arc<Mutex<HashMap<String, String>>>;
+type DB = Arc<Mutex<HashMap<Id, String>>>;
+type Key = Id;
 use crate::Err::*;
+use Rest::*;
 
 fn main() {
     // Configuration via env variables
@@ -16,9 +20,19 @@ fn main() {
         .unwrap_or_else(|_| net::IpAddr::V4(net::Ipv4Addr::new(127, 0, 0, 1)));
 
     // Optional key for single-user mode; `USER:PASSWORD`
-    // We must base64-encode the key and prefix it with `Basic ` to match curl's format
-    let prefix = |s| format!("Basic {}", s);
-    let key = env::var("KEY").map(|s| base64::encode(&s)).map(prefix).ok();
+    let key = env::var("KEY")
+        .map(|k| {
+            Key::try_from(k.as_str())
+                .map_err(|_| {
+                    eprintln!("Invalid key!");
+                    std::process::exit(1);
+                })
+                .unwrap()
+        })
+        .ok();
+
+    let display_key = key.clone();
+
     let key = warp::any().map(move || key.clone());
 
     // Store all IP addresses in a thread-safe hash map
@@ -29,11 +43,12 @@ fn main() {
         .and(header("authorization"))
         .and(db.clone())
         .and_then(move |id: String, ip: DB| -> WarpResult {
+            let id = Id::from_basic(&id);
             match ip.lock().map_err(|_| warp_err(Db))?.get(&id) {
                 Some(ip) => {
-                    println!("GET:\tip:{}\tid:{}", &ip, &id);
+                    log(&Get, &ip, &id);
                     Ok(ip.to_string())
-                },
+                }
                 None => Err(warp::reject::custom(NotFound)),
             }
         });
@@ -43,26 +58,25 @@ fn main() {
         .and(warp::header::<String>("authorization"))
         .and(db.clone())
         .and(key.clone())
-        .and_then(move |ip: String, id: String, db: DB, key: Option<String>| {
-            let dbgip = ip.clone();
-            let dbgid = id.clone();
+        .and_then(move |ip: String, id: String, db: DB, key: Option<Key>| {
+            let id = Id::from_basic(&id);
             if key.is_some() && key.unwrap() != id {
                 return Err(warp_err(Unauthorized));
             }
+            log(&Post, &ip, &id);
             db.lock().map_err(|_| warp_err(Db))?.insert(id, ip.clone());
-            println!("POST:\tip:{}\tid:{}", dbgip, dbgid);
             Ok(ip)
         });
 
     let delete = warp::delete2()
         .and(header("authorization"))
         .and(db)
-        .and_then(move |id: String, db: DB| -> WarpResult {
+        .and_then(move |id: Id, db: DB| -> WarpResult {
             match db.lock().map_err(|_| warp_err(Db))?.remove(&id) {
                 Some(ip) => {
-                    println!("DELETE:\tip:{}\tid:{}", &ip, &id);
+                    log(&Delete, &ip, &id);
                     Ok(format!("IP deleted for ID: {}", &id))
-                },
+                }
                 None => Err(warp_err(NotFound)),
             }
         });
@@ -75,73 +89,35 @@ fn main() {
     };
 
     eprintln!("d5 running on {}:{}", addr, port);
+
+    if let Some(k) = display_key {
+        eprintln!("Using key '{}'", k);
+    }
+
     warp::serve(get.or(post).or(delete).recover(handle_err)).run((addr, port));
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct Id {
-    user: String,
-    password: String,
-    encoded: String,
+fn log(rest: &Rest, ip: &str, id: &Id) {
+    let now = chrono::Local::now();
+    let message = format!("[{}] USER:{} IP:{}", rest, id.user, ip);
+    systemd::journal::print(6, &message);
+    println!("{}: {}", now, message);
 }
 
-impl Id {
-    fn new(user: &str, password: &str) -> Self {
-        Id { 
-            user: user.into(),
-            password: password.into(),
-            encoded: base64::encode(&format!("{}:{}", user, password)),
-        }
-    }
-
-    fn basic(&self) -> String {
-        format!("Basic {}", self.encoded)
-    }
+/// The HTTP REST methods
+#[derive(Debug)]
+enum Rest {
+    Post,
+    Get,
+    // Put,
+    // Patch,
+    Delete,
 }
 
-impl TryFrom<&str> for Id {
-    type Error = std::io::Error;
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        let split = s.trim().split(':').collect::<Vec<&str>>();
-        match split.len() {
-            2 => Ok(Id::new(split[0], split[1])),
-            _ => Err(std::io::Error::from(std::io::ErrorKind::InvalidInput))
-        }
-    }
-}
-
-impl fmt::Display for Id {
+impl fmt::Display for Rest {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}:{}", self.user, self.password)
+        write!(f, "{}", format!("{:?}", self).to_uppercase())
     }
-}
-
-#[test]
-fn encode_id() {
-    let id = Id::new("derp", "flerp");
-    dbg!(&id);
-    assert_eq!(format!("{}", id.basic()), "Basic ZGVycDpmbGVycA==");
-}
-
-#[test]
-fn convert_id() {
-    let id_try = Id::try_from("derp:flerp").unwrap();
-    let id_exp = Id::new("derp", "flerp");
-    assert_eq!(id_try, id_exp);
-}
-
-#[test]
-fn convert_id_err() {
-    assert!(Id::try_from("derpflerp").is_err());
-    assert!(Id::try_from(":derpflerp:").is_err());
-    assert!(Id::try_from(":derpflerp").is_ok());
-    assert!(Id::try_from("derpflerp:").is_ok());
-
-    let id = Id::try_from(":derpflerp").unwrap();
-    assert!(id.user.is_empty());
-
-    let id = Id::try_from("derpflerp:").unwrap();
-    assert!(id.password.is_empty());
 }
 
 #[derive(Debug)]
@@ -153,11 +129,15 @@ enum Err {
 
 impl fmt::Display for Err {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "{}", match self {
-            Self::Db => "Internal server error.",
-            Self::NotFound => "No IP found for that username–password pair.",
-            Self::Unauthorized => "Unauthorized request.",
-        })
+        writeln!(
+            f,
+            "{}",
+            match self {
+                Self::Db => "Internal server error.",
+                Self::NotFound => "No IP found for that username–password pair.",
+                Self::Unauthorized => "Unauthorized request.",
+            }
+        )
     }
 }
 
