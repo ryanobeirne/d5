@@ -1,4 +1,4 @@
-use std::{collections::HashMap, convert::TryFrom, env, fmt, net, sync::Arc, sync::Mutex};
+use std::{collections::HashMap, convert::TryFrom, env, fmt, net, sync::Arc, sync::RwLock};
 use warp::{header, reply::with_status, Filter};
 use warp::{http::StatusCode as Code, reject::custom as warp_err};
 
@@ -6,7 +6,7 @@ mod id;
 use id::Id;
 
 type WarpResult = Result<String, warp::Rejection>;
-type DB = Arc<Mutex<HashMap<Id, String>>>;
+type DB = Arc<RwLock<HashMap<Id, String>>>;
 type Key = Id;
 use crate::Err::*;
 use Rest::*;
@@ -36,7 +36,7 @@ fn main() {
     let key = warp::any().map(move || key.clone());
 
     // Store all IP addresses in a thread-safe hash map
-    let db: DB = Arc::new(Mutex::new(HashMap::new()));
+    let db: DB = Arc::new(RwLock::new(HashMap::new()));
     let db = warp::any().map(move || db.clone());
 
     let get = warp::get2()
@@ -44,7 +44,7 @@ fn main() {
         .and(db.clone())
         .and_then(move |id: String, ip: DB| -> WarpResult {
             let id = Id::from_basic(&id);
-            match ip.lock().map_err(|_| warp_err(Db))?.get(&id) {
+            match ip.read().map_err(|_| warp_err(Db))?.get(&id) {
                 Some(ip) => {
                     log(&Get, &ip, &id);
                     Ok(ip.to_string())
@@ -64,7 +64,7 @@ fn main() {
                 return Err(warp_err(Unauthorized));
             }
             log(&Post, &ip, &id);
-            db.lock().map_err(|_| warp_err(Db))?.insert(id, ip.clone());
+            db.write().map_err(|_| warp_err(Db))?.insert(id, ip.clone());
             Ok(ip)
         });
 
@@ -72,7 +72,7 @@ fn main() {
         .and(header("authorization"))
         .and(db)
         .and_then(move |id: Id, db: DB| -> WarpResult {
-            match db.lock().map_err(|_| warp_err(Db))?.remove(&id) {
+            match db.write().map_err(|_| warp_err(Db))?.remove(&id) {
                 Some(ip) => {
                     log(&Delete, &ip, &id);
                     Ok(format!("IP deleted for ID: {}", &id))
