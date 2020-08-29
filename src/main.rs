@@ -1,6 +1,20 @@
-use std::{collections::HashMap, convert::TryFrom, env, fmt, net, sync::Arc, sync::RwLock};
-use warp::{header, reply::with_status, Filter};
-use warp::{http::StatusCode as Code, reject::custom as warp_err};
+use std::{
+    collections::HashMap,
+    convert::TryFrom,
+    env,
+    fmt,
+    net,
+    sync::Arc,
+    sync::RwLock,
+};
+
+use warp::{
+    Filter,
+    header,
+    http::StatusCode as Code,
+    reject::custom as warp_err,
+    reply::with_status,
+};
 
 mod id;
 use id::Id;
